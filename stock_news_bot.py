@@ -63,7 +63,7 @@ class StockNewsBot(discord.Client):
                     price = hist["Close"][-1]
                 else:
                     return False
-            return 1 <= price <= 10
+            return 0.1 <= price <= 10
         except Exception as e:
             logger.warning(f"⚠ Error fetching price for {ticker}: {e}")
             return False
