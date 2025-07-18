@@ -5,18 +5,32 @@ import os
 import yfinance as yf
 import logging
 import datetime
+import pytz
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-# Config - replace or set env vars
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN") or "your_discord_token_here"
-BENZINGA_API_KEY = os.getenv("BENZINGA_API_KEY") or "your_benzinga_api_key_here"
-CHANNEL_ID = int(os.getenv("CHANNEL_ID") or 123456789012345678)  # Discord channel ID
+# Config - set these as env vars or replace with your values
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN") 
+BENZINGA_API_KEY = os.getenv("BENZINGA_API_KEY") 
+CHANNEL_ID = int(os.getenv("CHANNEL_ID") )  # Discord channel ID
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 intents = discord.Intents.default()
 intents.message_content = True
+
+ET = pytz.timezone("US/Eastern")
+
+def get_session_name(now_et):
+    time_only = now_et.time()
+    if datetime.time(4,0) <= time_only < datetime.time(9,30):
+        return "Pre-market"
+    elif datetime.time(9,30) <= time_only < datetime.time(16,0):
+        return "Regular market"
+    elif datetime.time(16,0) <= time_only <= datetime.time(20,0):
+        return "Post-market"
+    else:
+        return "Closed"
 
 class StockNewsBot(discord.Client):
     def __init__(self, **kwargs):
@@ -25,8 +39,7 @@ class StockNewsBot(discord.Client):
         self.channel = None
         self.news_lock = asyncio.Lock()
         self.analyzer = SentimentIntensityAnalyzer()
-        self.latest_gainers = set()
-        self.gainer_timestamps = {}  # ticker -> datetime last detected
+        self.gainer_timestamps = {}  # ticker -> (datetime detected, session)
         self.news_task = None
         self.gainer_task = None
 
@@ -62,21 +75,6 @@ class StockNewsBot(discord.Client):
             logger.warning(f"⚠ Error fetching price for {ticker}: {e}")
             return False
 
-    def get_current_price(self, ticker):
-        if not ticker:
-            return None
-        try:
-            stock = yf.Ticker(ticker)
-            price = stock.info.get("regularMarketPrice")
-            if price is None:
-                hist = stock.history(period="1d")
-                if not hist.empty:
-                    price = hist["Close"][-1]
-            return price
-        except Exception as e:
-            logger.warning(f"⚠ Error fetching price for {ticker}: {e}")
-            return None
-
     def analyze_sentiment(self, text):
         scores = self.analyzer.polarity_scores(text)
         if scores["compound"] >= 0.05:
@@ -86,21 +84,43 @@ class StockNewsBot(discord.Client):
         else:
             return "➖ Neutral"
 
-    def has_increased_10_percent_intraday(self, ticker):
+    def has_increased_in_session(self, ticker):
         try:
             stock = yf.Ticker(ticker)
             hist = stock.history(period="1d", interval="5m")
-            if hist.empty or len(hist) < 2:
-                return False
-            open_price = hist['Open'][0]
-            latest_price = hist['Close'][-1]
+            if hist.empty:
+                return False, None
+            # Convert index to ET
+            hist.index = hist.index.tz_convert(ET)
+            now_et = datetime.datetime.now(ET)
+            session = get_session_name(now_et)
+            if session == "Closed":
+                return False, session
+
+            # Filter data to session timeframe
+            if session == "Pre-market":
+                mask = (hist.index.time >= datetime.time(4,0)) & (hist.index.time < datetime.time(9,30))
+            elif session == "Regular market":
+                mask = (hist.index.time >= datetime.time(9,30)) & (hist.index.time < datetime.time(16,0))
+            elif session == "Post-market":
+                mask = (hist.index.time >= datetime.time(16,0)) & (hist.index.time <= datetime.time(20,0))
+            else:
+                return False, session
+
+            session_data = hist.loc[mask]
+            if session_data.empty or len(session_data) < 2:
+                return False, session
+
+            open_price = session_data['Open'][0]
+            last_price = session_data['Close'][-1]
             if open_price == 0:
-                return False
-            percent_change = ((latest_price - open_price) / open_price) * 100
-            return percent_change >= 10
+                return False, session
+
+            percent_change = ((last_price - open_price) / open_price) * 100
+            return (percent_change >= 10), session
         except Exception as e:
-            logger.warning(f"Error checking intraday increase for {ticker}: {e}")
-            return False
+            logger.warning(f"Error checking session gain for {ticker}: {e}")
+            return False, None
 
     async def news_loop(self):
         await self.wait_until_ready()
@@ -116,19 +136,35 @@ class StockNewsBot(discord.Client):
         await self.wait_until_ready()
         while not self.is_closed():
             await asyncio.sleep(600)  # every 10 minutes
-            if self.latest_gainers and self.channel:
-                gainers_msg = "🚀 **Gainer Alert!** The following stocks moved up 10% or more in the last 30 minutes:\n"
-                gainers_msg += ", ".join(f"${t}" for t in sorted(self.latest_gainers))
+
+            if not self.gainer_timestamps:
+                continue
+
+            now = datetime.datetime.now(ET)
+            threshold = now - datetime.timedelta(minutes=30)  # keep gainers last 30 mins
+
+            # Clean old gainers
+            self.gainer_timestamps = {t: (ts, ses) for t, (ts, ses) in self.gainer_timestamps.items() if ts > threshold}
+            if not self.gainer_timestamps:
+                continue
+
+            # Group gainers by session
+            gainers_by_session = {}
+            for ticker, (_, session) in self.gainer_timestamps.items():
+                gainers_by_session.setdefault(session, set()).add(ticker)
+
+            # Send messages grouped by session
+            for session_name, tickers in gainers_by_session.items():
+                msg = f"🚀 **{session_name} Gainers** (10%+ increase):\n" + ", ".join(f"${t}" for t in sorted(tickers))
                 try:
-                    await self.channel.send(gainers_msg)
+                    await self.channel.send(msg)
                 except Exception as e:
                     logger.warning(f"⚠ Failed to send gainer alert: {e}")
 
     async def fetch_and_send_news(self):
         async with self.news_lock:
             news_items = self.get_latest_news()
-            now = datetime.datetime.utcnow()
-            gainer_tickers = set()
+            now_et = datetime.datetime.now(ET)
 
             for news in news_items:
                 tickers_data = news.get("stocks", [])
@@ -154,15 +190,11 @@ class StockNewsBot(discord.Client):
                         await asyncio.sleep(1)
                         break  # Send one message per news only
 
-                # Update gainers timestamps for intraday +10%
+                # Check gainers for this news tickers
                 for ticker in tickers:
-                    if self.has_increased_10_percent_intraday(ticker):
-                        self.gainer_timestamps[ticker] = now
-
-            # Clean old gainers (older than 30 min)
-            threshold = now - datetime.timedelta(minutes=30)
-            self.gainer_timestamps = {t: ts for t, ts in self.gainer_timestamps.items() if ts > threshold}
-            self.latest_gainers = set(self.gainer_timestamps.keys())
+                    increased, session = self.has_increased_in_session(ticker)
+                    if increased and session != "Closed":
+                        self.gainer_timestamps[ticker] = (now_et, session)
 
     async def on_ready(self):
         logger.info(f"✅ Logged in as {self.user}")
@@ -186,7 +218,16 @@ class StockNewsBot(discord.Client):
 
         elif content[0].lower() == "!price" and len(content) > 1:
             ticker = content[1].upper()
-            price = self.get_current_price(ticker)
+            price = None
+            try:
+                stock = yf.Ticker(ticker)
+                price = stock.info.get("regularMarketPrice")
+                if price is None:
+                    hist = stock.history(period="1d")
+                    if not hist.empty:
+                        price = hist["Close"][-1]
+            except:
+                price = None
             if price:
                 await message.channel.send(f"💲 **${ticker}** is currently **${price:.2f}**")
             else:
@@ -205,10 +246,23 @@ class StockNewsBot(discord.Client):
                 await message.channel.send(f"⚠ No recent news found for {ticker}.")
 
         elif content[0].lower() == "!latestgainers":
-            if self.latest_gainers:
-                await message.channel.send(f"🚀 Latest gainers:\n" + ", ".join(f"${t}" for t in sorted(self.latest_gainers)))
+            if self.gainer_timestamps:
+                now = datetime.datetime.now(ET)
+                threshold = now - datetime.timedelta(minutes=30)
+                # Clean old gainers
+                self.gainer_timestamps = {t: (ts, ses) for t, (ts, ses) in self.gainer_timestamps.items() if ts > threshold}
+                if not self.gainer_timestamps:
+                    await message.channel.send("No gainers found in the last 30 minutes.")
+                    return
+                gainers_by_session = {}
+                for ticker, (_, session) in self.gainer_timestamps.items():
+                    gainers_by_session.setdefault(session, set()).add(ticker)
+                msg = ""
+                for session_name, tickers in gainers_by_session.items():
+                    msg += f"🚀 **{session_name} Gainers:** " + ", ".join(f"${t}" for t in sorted(tickers)) + "\n"
+                await message.channel.send(msg)
             else:
-                await message.channel.send("No gainers found in the last 30 minutes.")
+                await message.channel.send("No gainers found.")
 
 if __name__ == "__main__":
     bot = StockNewsBot(intents=intents)
