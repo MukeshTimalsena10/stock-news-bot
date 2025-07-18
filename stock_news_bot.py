@@ -4,11 +4,12 @@ import asyncio
 import os
 import yfinance as yf
 import logging
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer  # ✅ NEW
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN") or "your_discord_token"
-BENZINGA_API_KEY = os.getenv("BENZINGA_API_KEY") or "your_benzinga_api_key"
-CHANNEL_ID = int(os.getenv("CHANNEL_ID") or 123456789012345678)
+# Environment variables or replace with your keys (do NOT hardcode in public repos)
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN") or "your_discord_token_here"
+BENZINGA_API_KEY = os.getenv("BENZINGA_API_KEY") or "your_benzinga_api_key_here"
+CHANNEL_ID = int(os.getenv("CHANNEL_ID") or 123456789012345678)  # Your Discord channel ID
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,12 +22,15 @@ class StockNewsBot(discord.Client):
         super().__init__(**kwargs)
         self.sent_titles = set()
         self.channel = None
-        self.news_task = None
         self.news_lock = asyncio.Lock()
-        self.analyzer = SentimentIntensityAnalyzer()  # ✅ NEW
+        self.analyzer = SentimentIntensityAnalyzer()
+        self.latest_gainers = set()
+        self.news_task = None
+        self.gainer_task = None
 
     async def setup_hook(self):
         self.news_task = self.loop.create_task(self.news_loop())
+        self.gainer_task = self.loop.create_task(self.gainer_alert_loop())
 
     def get_latest_news(self):
         url = f"https://api.benzinga.com/api/v2/news?token={BENZINGA_API_KEY}&channels=stock&pagesize=30"
@@ -37,19 +41,6 @@ class StockNewsBot(discord.Client):
             return r.json()
         except Exception as e:
             logger.warning(f"⚠ Error fetching Benzinga news: {e}")
-            return []
-
-    def get_news_for_ticker(self, ticker):
-        if not ticker:
-            return []
-        url = f"https://api.benzinga.com/api/v2/news?token={BENZINGA_API_KEY}&tickers={ticker}&pagesize=5"
-        headers = {"Accept": "application/json"}
-        try:
-            r = requests.get(url, headers=headers, timeout=10)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            logger.warning(f"⚠ Error fetching news for {ticker}: {e}")
             return []
 
     def check_price_in_range(self, ticker):
@@ -64,7 +55,7 @@ class StockNewsBot(discord.Client):
                     price = hist["Close"][-1]
                 else:
                     return False
-            return 0.1 <= price <= 10  # ✅ Price range (updated earlier)
+            return 0.1 <= price <= 10
         except Exception as e:
             logger.warning(f"⚠ Error fetching price for {ticker}: {e}")
             return False
@@ -84,7 +75,7 @@ class StockNewsBot(discord.Client):
             logger.warning(f"⚠ Error fetching price for {ticker}: {e}")
             return None
 
-    def analyze_sentiment(self, text):  # ✅ NEW
+    def analyze_sentiment(self, text):
         scores = self.analyzer.polarity_scores(text)
         if scores["compound"] >= 0.05:
             return "✅ Positive"
@@ -92,6 +83,22 @@ class StockNewsBot(discord.Client):
             return "❌ Negative"
         else:
             return "➖ Neutral"
+
+    def has_increased_10_percent(self, ticker):
+        try:
+            stock = yf.Ticker(ticker)
+            hist = stock.history(period="2d")
+            if len(hist) < 2:
+                return False
+            prev_close = hist['Close'][-2]
+            latest_close = hist['Close'][-1]
+            if prev_close == 0:
+                return False
+            percent_change = ((latest_close - prev_close) / prev_close) * 100
+            return percent_change >= 10
+        except Exception as e:
+            logger.warning(f"Error checking increase for {ticker}: {e}")
+            return False
 
     async def news_loop(self):
         await self.wait_until_ready()
@@ -103,9 +110,23 @@ class StockNewsBot(discord.Client):
             await self.fetch_and_send_news()
             await asyncio.sleep(120)  # every 2 minutes
 
+    async def gainer_alert_loop(self):
+        await self.wait_until_ready()
+        while not self.is_closed():
+            await asyncio.sleep(600)  # every 10 minutes
+            if self.latest_gainers and self.channel:
+                gainers_msg = "🚀 **Gainer Alert!** The following stocks moved up 10% or more today:\n"
+                gainers_msg += ", ".join(f"${t}" for t in self.latest_gainers)
+                try:
+                    await self.channel.send(gainers_msg)
+                except Exception as e:
+                    logger.warning(f"⚠ Failed to send gainer alert: {e}")
+
     async def fetch_and_send_news(self):
         async with self.news_lock:
             news_items = self.get_latest_news()
+            gainer_tickers = set()
+
             for news in news_items:
                 tickers_data = news.get("stocks", [])
                 tickers = [
@@ -116,8 +137,9 @@ class StockNewsBot(discord.Client):
 
                 title = news.get("title", "")
                 url = news.get("url", "")
-                sentiment = self.analyze_sentiment(title)  # ✅ NEW
+                sentiment = self.analyze_sentiment(title)
 
+                # Send news message if price in range and not sent before
                 for ticker in tickers:
                     if ticker not in self.sent_titles and self.check_price_in_range(ticker):
                         msg = f"{sentiment} **${ticker}**: {title}\n{url}"
@@ -128,6 +150,13 @@ class StockNewsBot(discord.Client):
                         self.sent_titles.add(ticker)
                         await asyncio.sleep(1)
                         break
+
+                # Check if any ticker gained 10% or more
+                for ticker in tickers:
+                    if self.has_increased_10_percent(ticker):
+                        gainer_tickers.add(ticker)
+
+            self.latest_gainers = gainer_tickers
 
     async def on_ready(self):
         logger.info(f"✅ Logged in as {self.user}")
@@ -161,7 +190,7 @@ class StockNewsBot(discord.Client):
 
         elif content[0].lower() == "!news" and len(content) > 1:
             ticker = content[1].upper()
-            news_list = self.get_news_for_ticker(ticker)
+            news_list = [n for n in self.get_latest_news() if ticker in [s['symbol'].upper() if isinstance(s, dict) else s.upper() for s in n.get("stocks", [])]]
             if news_list:
                 msg = f"📰 Latest news for **${ticker}**:\n"
                 for item in news_list[:5]:
@@ -170,6 +199,12 @@ class StockNewsBot(discord.Client):
                 await message.channel.send(msg)
             else:
                 await message.channel.send(f"⚠ No recent news found for {ticker}.")
+
+        elif content[0].lower() == "!latestgainers":
+            if self.latest_gainers:
+                await message.channel.send(f"🚀 Latest gainers:\n" + ", ".join(f"${t}" for t in self.latest_gainers))
+            else:
+                await message.channel.send("No gainers found in the last check.")
 
 if __name__ == "__main__":
     bot = StockNewsBot(intents=intents)
