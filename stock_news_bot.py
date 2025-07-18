@@ -4,6 +4,7 @@ import asyncio
 import os
 import yfinance as yf
 import logging
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer  # ✅ NEW
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN") or "your_discord_token"
 BENZINGA_API_KEY = os.getenv("BENZINGA_API_KEY") or "your_benzinga_api_key"
@@ -13,7 +14,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 intents = discord.Intents.default()
-intents.message_content = True  # Required for reading commands
+intents.message_content = True
 
 class StockNewsBot(discord.Client):
     def __init__(self, **kwargs):
@@ -22,6 +23,7 @@ class StockNewsBot(discord.Client):
         self.channel = None
         self.news_task = None
         self.news_lock = asyncio.Lock()
+        self.analyzer = SentimentIntensityAnalyzer()  # ✅ NEW
 
     async def setup_hook(self):
         self.news_task = self.loop.create_task(self.news_loop())
@@ -38,7 +40,6 @@ class StockNewsBot(discord.Client):
             return []
 
     def get_news_for_ticker(self, ticker):
-        """Fetch 5 latest news headlines for a specific ticker"""
         if not ticker:
             return []
         url = f"https://api.benzinga.com/api/v2/news?token={BENZINGA_API_KEY}&tickers={ticker}&pagesize=5"
@@ -63,7 +64,7 @@ class StockNewsBot(discord.Client):
                     price = hist["Close"][-1]
                 else:
                     return False
-            return 0.1 <= price <= 10
+            return 0.1 <= price <= 10  # ✅ Price range (updated earlier)
         except Exception as e:
             logger.warning(f"⚠ Error fetching price for {ticker}: {e}")
             return False
@@ -83,6 +84,15 @@ class StockNewsBot(discord.Client):
             logger.warning(f"⚠ Error fetching price for {ticker}: {e}")
             return None
 
+    def analyze_sentiment(self, text):  # ✅ NEW
+        scores = self.analyzer.polarity_scores(text)
+        if scores["compound"] >= 0.05:
+            return "✅ Positive"
+        elif scores["compound"] <= -0.05:
+            return "❌ Negative"
+        else:
+            return "➖ Neutral"
+
     async def news_loop(self):
         await self.wait_until_ready()
         self.channel = self.get_channel(CHANNEL_ID)
@@ -98,8 +108,6 @@ class StockNewsBot(discord.Client):
             news_items = self.get_latest_news()
             for news in news_items:
                 tickers_data = news.get("stocks", [])
-
-                # ✅ Skip invalid/empty tickers (fix for NoneType issue)
                 tickers = [
                     (stock.get("symbol") if isinstance(stock, dict) else stock).upper()
                     for stock in tickers_data
@@ -108,10 +116,11 @@ class StockNewsBot(discord.Client):
 
                 title = news.get("title", "")
                 url = news.get("url", "")
+                sentiment = self.analyze_sentiment(title)  # ✅ NEW
 
                 for ticker in tickers:
                     if ticker not in self.sent_titles and self.check_price_in_range(ticker):
-                        msg = f"**${ticker}**: {title}\n{url}"
+                        msg = f"{sentiment} **${ticker}**: {title}\n{url}"
                         try:
                             await self.channel.send(msg)
                         except Exception as e:
@@ -156,7 +165,8 @@ class StockNewsBot(discord.Client):
             if news_list:
                 msg = f"📰 Latest news for **${ticker}**:\n"
                 for item in news_list[:5]:
-                    msg += f"- [{item.get('title')}]({item.get('url')})\n"
+                    sentiment = self.analyze_sentiment(item.get("title", ""))
+                    msg += f"- {sentiment} [{item.get('title')}]({item.get('url')})\n"
                 await message.channel.send(msg)
             else:
                 await message.channel.send(f"⚠ No recent news found for {ticker}.")
