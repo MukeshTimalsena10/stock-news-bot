@@ -1,7 +1,7 @@
 import os
 import discord
 import asyncio
-import requests
+from datetime import datetime
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
@@ -14,48 +14,30 @@ client = discord.Client(intents=intents)
 async def on_ready():
     print(f"✅ Logged in as {client.user}")
 
-    try:
-        channel = client.get_channel(CHANNEL_ID)
+    channel = client.get_channel(CHANNEL_ID)
+    if channel:
+        await channel.send("✅ Bot is now running 24/7 on Render! 🚀\nStarting test news feed...")
+        print("✅ Startup message sent successfully!")
+    else:
+        print("❌ Could not find the channel. Check CHANNEL_ID.")
 
-        if channel:
-            await channel.send("✅ Bot is now running 24/7 on Render! 🚀")
-            print("✅ Startup message sent successfully!")
-        else:
-            print("❌ Could not find the channel. Check CHANNEL_ID.")
-    except Exception as e:
-        print(f"❌ Error sending startup message: {e}")
-
-    # Start news loop
+    # Start test news loop
     client.loop.create_task(news_loop())
 
 async def news_loop():
-    """Fetch and send stock news every 10 minutes"""
+    """Send fake stock news every 1 minute for testing"""
     await client.wait_until_ready()
     channel = client.get_channel(CHANNEL_ID)
 
     while not client.is_closed():
         try:
-            news = get_stock_news()
-            if news and channel:
-                for n in news:
-                    await channel.send(f"📰 **{n['title']}**\n{n['url']}")
+            if channel:
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                await channel.send(f"📰 **TEST NEWS** - Stock XYZ is up 5%! ({now})")
+                print(f"✅ Sent test news at {now}")
         except Exception as e:
             print(f"❌ Error in news loop: {e}")
 
-        await asyncio.sleep(600)  # Wait 10 minutes before next check
-
-def get_stock_news():
-    """Dummy example news fetcher - replace with real API"""
-    try:
-        # Example API (replace with your news API or yfinance logic)
-        response = requests.get("https://finnhub.io/api/v1/news?category=general&token=YOUR_API_KEY")
-        if response.status_code == 200:
-            return [{"title": x["headline"], "url": x["url"]} for x in response.json()[:3]]
-        else:
-            print("❌ Failed to fetch news.")
-            return []
-    except Exception as e:
-        print(f"❌ Error fetching news: {e}")
-        return []
+        await asyncio.sleep(60)  # every 1 minute for testing
 
 client.run(TOKEN)
